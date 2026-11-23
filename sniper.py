@@ -25,6 +25,7 @@ AUCTION_WINDOW_HOURS = 3       # auctions: only alert when ending within this wi
 SEARCH_PAGES = 2               # 200 listings per page per query
 CSV_PATH = Path("dexcollection.csv")
 STATE_PATH = Path("seen.json")
+WANT_PATH = Path("wantlist.json")
 
 SETS = {  # name -> (pokemontcg.io id, printed total)
     "Fossil": ("base3", 62),
@@ -84,22 +85,55 @@ def best_market(card):
     return min(vals) if vals else None
 
 
+def fetch_set(set_id, headers, tries=5):
+    """pokemontcg.io throws random 500s/timeouts, so retry with backoff."""
+    import time
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get("https://api.pokemontcg.io/v2/cards", headers=headers, timeout=90,
+                             params={"q": f"set.id:{set_id}", "pageSize": 250,
+                                     "select": "name,number,tcgplayer"})
+            r.raise_for_status()
+            return r.json()["data"]
+        except requests.RequestException as e:
+            last = e
+            wait = 5 * (2 ** i)
+            print(f"pokemontcg.io {set_id} failed ({e}); retry in {wait}s")
+            time.sleep(wait)
+    raise last
+
+
 def build_want_list(csv_path):
-    """{number: [ {set, name, number, market} ]} for cards you don't own."""
+    """{number: [ {set, name, number, market} ]} for cards you don't own.
+    Cached in wantlist.json: refreshed daily or when the CSV changes. If the
+    card-data site is down, a stale cache is used instead of failing."""
+    import hashlib
+    csv_hash = hashlib.sha1(Path(csv_path).read_bytes()).hexdigest()
+    cache = json.loads(WANT_PATH.read_text()) if WANT_PATH.exists() else None
+    if cache and cache.get("csv") == csv_hash:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(cache["at"])
+        if age < timedelta(hours=24):
+            return cache["want"]
     owned = owned_numbers(csv_path)
     headers = {"X-Api-Key": os.environ["POKEMONTCG_API_KEY"]} if os.environ.get("POKEMONTCG_API_KEY") else {}
     want = {}
-    for set_name, (set_id, _tot) in SETS.items():
-        r = requests.get("https://api.pokemontcg.io/v2/cards", headers=headers, timeout=60,
-                         params={"q": f"set.id:{set_id}", "pageSize": 250,
-                                 "select": "name,number,tcgplayer"})
-        r.raise_for_status()
-        for c in r.json()["data"]:
-            if c["number"] in owned[set_name]:
-                continue
-            want.setdefault(c["number"], []).append(
-                {"set": set_name, "name": c["name"], "number": c["number"],
-                 "market": best_market(c)})
+    try:
+        for set_name, (set_id, _tot) in SETS.items():
+            for c in fetch_set(set_id, headers):
+                if c["number"] in owned[set_name]:
+                    continue
+                want.setdefault(c["number"], []).append(
+                    {"set": set_name, "name": c["name"], "number": c["number"],
+                     "market": best_market(c)})
+    except requests.RequestException:
+        if cache and cache.get("csv") == csv_hash:
+            print("Card-data site down; using stale cached want list")
+            return cache["want"]
+        raise
+    WANT_PATH.write_text(json.dumps({"csv": csv_hash,
+                                     "at": datetime.now(timezone.utc).isoformat(),
+                                     "want": want}))
     return want
 
 
