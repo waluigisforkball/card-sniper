@@ -29,5 +29,5 @@ jobs:
         run: |
           git config user.name "card-sniper"
           git config user.email "card-sniper@users.noreply.github.com"
-          git add seen.json || true
+          git add seen.json wantlist.json || true
           git diff --cached --quiet || (git commit -m "update seen listings" && git push)
