@@ -177,8 +177,9 @@ def ebay_token():
     print(f"eBay keys: id length={len(cid)} ({env} key), secret length={len(secret)}")
     if not cid or not secret:
         raise SystemExit("EBAY_CLIENT_ID or EBAY_CLIENT_SECRET is empty: check the GitHub secret NAMES are exact")
-    if "-PRD-" in secret or secret.count("-") >= 3:
-        raise SystemExit("EBAY_CLIENT_SECRET looks like an App ID: the two secrets may be swapped")
+    # App IDs look like Name-app-PRD-xxxx; Cert IDs start with PRD-. Swapped if the reverse.
+    if cid.startswith(("PRD-", "SBX-")) and ("-PRD-" in secret or "-SBX-" in secret):
+        raise SystemExit("EBAY_CLIENT_ID and EBAY_CLIENT_SECRET look swapped")
     auth = base64.b64encode(f"{cid}:{secret}".encode()).decode()
     r = requests.post(f"{EBAY_API}/identity/v1/oauth2/token", timeout=30,
                       headers={"Authorization": f"Basic {auth}",
