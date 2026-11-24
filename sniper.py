@@ -170,14 +170,23 @@ def match_title(title, want):
 
 # ---------------- eBay ----------------
 def ebay_token():
-    cid, secret = os.environ["EBAY_CLIENT_ID"], os.environ["EBAY_CLIENT_SECRET"]
+    cid = os.environ.get("EBAY_CLIENT_ID", "").strip()
+    secret = os.environ.get("EBAY_CLIENT_SECRET", "").strip()
+    # Safe diagnostics: never prints the secret itself
+    env = "PRODUCTION" if "-PRD-" in cid else "SANDBOX" if "-SBX-" in cid else "unknown"
+    print(f"eBay keys: id length={len(cid)} ({env} key), secret length={len(secret)}")
+    if not cid or not secret:
+        raise SystemExit("EBAY_CLIENT_ID or EBAY_CLIENT_SECRET is empty: check the GitHub secret NAMES are exact")
+    if "-PRD-" in secret or secret.count("-") >= 3:
+        raise SystemExit("EBAY_CLIENT_SECRET looks like an App ID: the two secrets may be swapped")
     auth = base64.b64encode(f"{cid}:{secret}".encode()).decode()
     r = requests.post(f"{EBAY_API}/identity/v1/oauth2/token", timeout=30,
                       headers={"Authorization": f"Basic {auth}",
                                "Content-Type": "application/x-www-form-urlencoded"},
                       data={"grant_type": "client_credentials",
                             "scope": "https://api.ebay.com/oauth/api_scope"})
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise SystemExit(f"eBay rejected the keys ({r.status_code}): {r.text[:300]}")
     return r.json()["access_token"]
 
 
