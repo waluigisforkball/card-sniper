@@ -21,8 +21,8 @@ import requests
 # ---------------- Config (edit these) ----------------
 DISCOUNT_THRESHOLD = 0.40      # alert when total cost <= 60% of market
 MIN_MARKET = 3.00              # ignore cards whose market price is under this ($)
-AUCTION_WINDOW_HOURS = 3       # auctions: only alert when ending within this window
-MAX_ALERTS = 15                # max pushes per run, best discounts first
+AUCTION_WINDOW_HOURS = 24      # auctions: only alert when ending within this window
+MAX_ALERTS = 25               # max pushes per run, best discounts first
 SEARCH_PAGES = 2              # 200 listings per page per query
 CSV_PATH = Path("dexcollection.csv")
 STATE_PATH = Path("seen.json")
