@@ -1,7 +1,7 @@
 name: card-sniper
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 min (GitHub may delay a few minutes)
+    - cron: "0 14 * * *"     # once a day at 14:00 UTC = 9am Eastern (8am in summer)
   workflow_dispatch: {}       # lets you run it manually from the Actions tab
 
 permissions:
@@ -32,4 +32,4 @@ jobs:
           git config user.email "card-sniper@users.noreply.github.com"
           git add seen.json || true
           git add wantlist.json || true
-          git diff --cached --quiet || (git commit -m "update seen listings" && git push)
+          git diff --cached --quiet || (git commit -m "update seen listings" && git pull --rebase -X theirs origin main && git push)
