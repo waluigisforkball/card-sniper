@@ -5,3 +5,9 @@
 // Team Rocket 21
 // Gym Challenge 66
 // Lines starting with // are ignored. Commit the file and the next run skips these cards.
+fossil 17/62
+gym challenge 22/132
+gym challenge 120/132
+gym heroes 125/132
+fossil 25/62
+fossil 7/62
