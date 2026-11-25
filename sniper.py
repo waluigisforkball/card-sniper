@@ -22,7 +22,8 @@ import requests
 DISCOUNT_THRESHOLD = 0.40      # alert when total cost <= 60% of market
 MIN_MARKET = 3.00              # ignore cards whose market price is under this ($)
 AUCTION_WINDOW_HOURS = 3       # auctions: only alert when ending within this window
-MAX_ALERTS = 25               # max pushes per run, best discounts first
+DIGEST_SIZE = 10               # deals per daily summary notification, best first
+MAX_CHECKS = 80                # listings to inspect per run when screening out reprints
 SEARCH_PAGES = 2              # 200 listings per page per query
 CSV_PATH = Path("dexcollection.csv")
 STATE_PATH = Path("seen.json")
@@ -244,52 +245,78 @@ def listing_cost(item, is_auction):
     return base, ship
 
 
-def specifics_conflict(token, item, card):
-    """Optional second check: compare eBay's own Card Number field to the title."""
+def verify_item(token, item_id, card):
+    """Read the listing's item specifics. Returns (keep, notes, year).
+    Drops reprints (Year Manufactured after 2001, or an anniversary/celebrations Set) and
+    flags a Card Number field that disagrees with the title. Sellers who leave these
+    blank (or lie) still get through."""
     try:
-        r = requests.get(f"{EBAY_API}/buy/browse/v1/item/{item['itemId']}", timeout=30,
+        r = requests.get(f"{EBAY_API}/buy/browse/v1/item/{item_id}", timeout=30,
                          headers={"Authorization": f"Bearer {token}",
                                   "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"})
         if r.status_code != 200:
-            return None
-        for a in r.json().get("localizedAspects", []):
-            if a.get("name", "").lower() == "card number":
-                v = a.get("value", "").split("/")[0].strip().lstrip("0")
-                if v and v != card["number"]:
-                    return f"eBay 'Card Number' field says {a['value']}"
+            return True, [], ""
+        aspects = {a.get("name", "").lower(): str(a.get("value", ""))
+                   for a in r.json().get("localizedAspects", [])}
     except requests.RequestException:
-        pass
-    return None
+        return True, [], ""
+    year = aspects.get("year manufactured", "")
+    m = re.search(r"(?:19|20)\d\d", year)
+    if m and int(m.group()) > 2001:
+        return False, [f"reprint: Year Manufactured {year}"], year
+    setname = aspects.get("set", "").lower()
+    if re.search(r"anniversary|celebrations|reprint|classic|legendary", setname):
+        return False, [f"reprint: Set says {aspects['set']}"], year
+    notes = []
+    num = aspects.get("card number", "")
+    v = num.split("/")[0].strip().lstrip("0")
+    if v and v != card["number"]:
+        notes.append(f"eBay 'Card Number' field says {num}")
+    return True, notes, year
 
 
 # ---------------- Alerts ----------------
-def send_alert(d, dry):
-    title = f"{d['pct']:.0f}% off: {d['card']['name']} {d['card']['number']} ({d['card']['set']})"
-    lines = [f"${d['total']:.2f} total vs ${d['card']['market']:.2f} market",
-             d["title"][:100]]
-    if d.get("condition"):
-        lines.append(f"Condition: {d['condition']}")
-    if d["auction"]:
-        lines.append(f"AUCTION ends {d['ends']} (current bid, may rise)")
-    lines += [f"Note: {n}" for n in d["notes"]]
-    body = "\n".join(lines)
+def send_digest(deals, dry):
+    """One notification listing the deals. Returns the deals that were included
+    (empty list = nothing sent / send failed)."""
+    included, parts, size = [], [], 0
+    for i, d in enumerate(deals, 1):
+        c = d["card"]
+        line = (f"{len(included) + 1}. {d['pct']:.0f}% off {c['set']} #{c['number']} {c['name']}: "
+                f"${d['total']:.2f} vs ${c['market']:.2f} market")
+        extras = [x for x in (d.get("condition"), d.get("year")) if x]
+        if d["auction"]:
+            extras.append("AUCTION, current bid")
+        extras += d["notes"]
+        if extras:
+            line += " (" + "; ".join(extras) + ")"
+        entry = line + "\n" + d["url"]
+        if size + len(entry.encode("utf-8")) > 3600:
+            break
+        parts.append(entry)
+        size += len(entry.encode("utf-8")) + 2
+        included.append(d)
+    if not included:
+        return []
+    top = included[0]
+    n = len(included)
+    title = f"{n} card deal{'s' if n > 1 else ''}: {top['pct']:.0f}% off {top['card']['name']}"
+    body = "\n\n".join(parts)
     if dry or not os.environ.get("NTFY_TOPIC"):
-        print(f"\n[ALERT] {title}\n{body}\n{d['url']}")
-        return True
+        print(f"\n[NOTIFICATION] {title}\n{body}")
+        return included
     try:
         r = requests.post(f"https://ntfy.sh/{os.environ['NTFY_TOPIC'].strip()}", timeout=30,
                           data=body.encode("utf-8"),
                           headers={"Title": title.encode("ascii", "ignore").decode(),
-                                   "Click": d["url"],
-                                   "Priority": "high" if d["auction"] else "default",
-                                   "Tags": "money_with_wings"})
+                                   "Click": top["url"], "Tags": "money_with_wings"})
     except requests.RequestException as e:
         print(f"ntfy push failed: {e}")
-        return False
+        return []
     if r.status_code != 200:
         print(f"ntfy push failed ({r.status_code}): {r.text[:150]}")
-        return False
-    return True
+        return []
+    return included
 
 
 # ---------------- Main ----------------
@@ -310,7 +337,6 @@ def run(dry):
             if end and datetime.fromisoformat(end.replace("Z", "+00:00")) <= window:
                 items[it["itemId"]] = (it, True)
     print(f"Scanned {len(items)} listings")
-    import time
     deals = []
     matched = 0
     for iid, (it, is_auction) in items.items():
@@ -337,17 +363,25 @@ def run(dry):
         print(f"  {d['pct']:.0f}% off{' [AUCTION]' if d['auction'] else ''} | {d['card']['set']} "
               f"#{d['card']['number']} {d['card']['name']} | ${d['total']:.2f} vs ${d['card']['market']:.2f} "
               f"| {d['condition'][:12]} | {d['title'][:70]}")
-    alerts = 0
-    for d in deals[:MAX_ALERTS]:
-        conflict = specifics_conflict(token, {"itemId": d["iid"]}, d["card"])
-        if conflict:
-            d["notes"].append(conflict)
-        if send_alert(d, dry):
+    keep, checks = [], 0
+    for d in deals:
+        if len(keep) >= DIGEST_SIZE or checks >= MAX_CHECKS:
+            break
+        checks += 1
+        ok, notes, year = verify_item(token, d["iid"], d["card"])
+        if not ok:
+            print(f"  skipped: {d['title'][:60]} | {notes[0]}")
             seen[d["iid"]] = now.isoformat()
-            alerts += 1
-            time.sleep(1.5)   # stay under ntfy's rate limit
-    if len(deals) > MAX_ALERTS:
-        print(f"{len(deals) - MAX_ALERTS} more deals held for the next run")
+            continue
+        d["notes"] += notes
+        d["year"] = year
+        keep.append(d)
+    sent = send_digest(keep, dry)
+    for d in sent:
+        seen[d["iid"]] = now.isoformat()
+    alerts = len(sent)
+    if len(deals) > checks:
+        print(f"{len(deals) - checks} more deals not inspected this run")
     # prune state older than 30 days
     cutoff = now - timedelta(days=30)
     seen = {k: v for k, v in seen.items() if datetime.fromisoformat(v) > cutoff}
