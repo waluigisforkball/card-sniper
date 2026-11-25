@@ -22,7 +22,8 @@ import requests
 DISCOUNT_THRESHOLD = 0.40      # alert when total cost <= 60% of market
 MIN_MARKET = 3.00              # ignore cards whose market price is under this ($)
 AUCTION_WINDOW_HOURS = 3       # auctions: only alert when ending within this window
-SEARCH_PAGES = 2               # 200 listings per page per query
+MAX_ALERTS = 15                # max pushes per run, best discounts first
+SEARCH_PAGES = 2              # 200 listings per page per query
 CSV_PATH = Path("dexcollection.csv")
 STATE_PATH = Path("seen.json")
 WANT_PATH = Path("wantlist.json")
@@ -253,12 +254,21 @@ def send_alert(d, dry):
     body = "\n".join(lines)
     if dry or not os.environ.get("NTFY_TOPIC"):
         print(f"\n[ALERT] {title}\n{body}\n{d['url']}")
-        return
-    requests.post(f"https://ntfy.sh/{os.environ['NTFY_TOPIC']}", timeout=30,
-                  data=body.encode("utf-8"),
-                  headers={"Title": title.encode("utf-8"), "Click": d["url"],
-                           "Priority": "high" if d["auction"] else "default",
-                           "Tags": "money_with_wings"})
+        return True
+    try:
+        r = requests.post(f"https://ntfy.sh/{os.environ['NTFY_TOPIC'].strip()}", timeout=30,
+                          data=body.encode("utf-8"),
+                          headers={"Title": title.encode("ascii", "ignore").decode(),
+                                   "Click": d["url"],
+                                   "Priority": "high" if d["auction"] else "default",
+                                   "Tags": "money_with_wings"})
+    except requests.RequestException as e:
+        print(f"ntfy push failed: {e}")
+        return False
+    if r.status_code != 200:
+        print(f"ntfy push failed ({r.status_code}): {r.text[:150]}")
+        return False
+    return True
 
 
 # ---------------- Main ----------------
@@ -279,13 +289,16 @@ def run(dry):
             if end and datetime.fromisoformat(end.replace("Z", "+00:00")) <= window:
                 items[it["itemId"]] = (it, True)
     print(f"Scanned {len(items)} listings")
-    alerts = 0
+    import time
+    deals = []
+    matched = 0
     for iid, (it, is_auction) in items.items():
         if iid in seen:
             continue
         m = match_title(it.get("title", ""), want)
         if not m or not m["card"]["market"] or m["card"]["market"] < MIN_MARKET:
             continue
+        matched += 1
         base, ship = listing_cost(it, is_auction)
         if base is None:
             continue
@@ -293,16 +306,26 @@ def run(dry):
         market = m["card"]["market"]
         if total > market * (1 - DISCOUNT_THRESHOLD):
             continue
-        notes = list(m["notes"])
-        conflict = specifics_conflict(token, it, m["card"])
+        deals.append({"iid": iid, "card": m["card"], "title": it["title"], "total": total,
+                      "pct": (1 - total / market) * 100, "auction": is_auction,
+                      "ends": it.get("itemEndDate", ""), "notes": list(m["notes"]),
+                      "url": it.get("itemWebUrl", "")})
+    deals.sort(key=lambda d: d["pct"], reverse=True)
+    print(f"Matched {matched} listings to your want list; {len(deals)} cleared the discount bar")
+    for d in deals[:60]:   # full detail in the log so you can sanity-check
+        print(f"  {d['pct']:.0f}% off | {d['card']['set']} #{d['card']['number']} {d['card']['name']} | "
+              f"${d['total']:.2f} vs ${d['card']['market']:.2f} | {d['title'][:70]}")
+    alerts = 0
+    for d in deals[:MAX_ALERTS]:
+        conflict = specifics_conflict(token, {"itemId": d["iid"]}, d["card"])
         if conflict:
-            notes.append(conflict)
-        send_alert({"card": m["card"], "title": it["title"], "total": total,
-                    "pct": (1 - total / market) * 100, "auction": is_auction,
-                    "ends": it.get("itemEndDate", ""), "notes": notes,
-                    "url": it.get("itemWebUrl", "")}, dry)
-        seen[iid] = now.isoformat()
-        alerts += 1
+            d["notes"].append(conflict)
+        if send_alert(d, dry):
+            seen[d["iid"]] = now.isoformat()
+            alerts += 1
+            time.sleep(1.5)   # stay under ntfy's rate limit
+    if len(deals) > MAX_ALERTS:
+        print(f"{len(deals) - MAX_ALERTS} more deals held for the next run")
     # prune state older than 30 days
     cutoff = now - timedelta(days=30)
     seen = {k: v for k, v in seen.items() if datetime.fromisoformat(v) > cutoff}
