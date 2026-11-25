@@ -21,7 +21,7 @@ import requests
 # ---------------- Config (edit these) ----------------
 DISCOUNT_THRESHOLD = 0.40      # alert when total cost <= 60% of market
 MIN_MARKET = 3.00              # ignore cards whose market price is under this ($)
-AUCTION_WINDOW_HOURS = 24      # auctions: only alert when ending within this window
+AUCTION_WINDOW_HOURS = 3       # auctions: only alert when ending within this window
 MAX_ALERTS = 25               # max pushes per run, best discounts first
 SEARCH_PAGES = 2              # 200 listings per page per query
 CSV_PATH = Path("dexcollection.csv")
@@ -49,7 +49,8 @@ CATEGORY_ID = "183454"  # CCG Individual Cards
 SKIP_WORDS = re.compile(
     r"\b(psa|bgs|cgc|sgc|ace|graded|slab|lot|bundle|proxy|custom|reprint|digital|"
     r"replica|orica|fan\s*made|sealed|booster|pack|complete set|master set|bulk|"
-    r"collection|cards? lot|set of|choose your|pick your)\b", re.I)
+    r"collection|cards? lot|set of|choose your|pick your|anniversary|celebrations?|"
+    r"25th|30th|gold|jumbo|oversized?)\b", re.I)
 NUM_RE = re.compile(r"(?<!\d)(\d{1,3})\s*/\s*(62|82|132)(?!\d)")
 
 EBAY_API = "https://api.ebay.com"
@@ -106,65 +107,83 @@ def fetch_set(set_id, headers, tries=5):
 
 
 def build_want_list(csv_path):
-    """{number: [ {set, name, number, market} ]} for cards you don't own.
-    Cached in wantlist.json: refreshed daily or when the CSV changes. If the
-    card-data site is down, a stale cache is used instead of failing."""
+    """Index of EVERY card in the four sets: {"num/total": [ {set,name,number,market,owned} ]}.
+    Owned cards are included so the matcher can tell that a title like
+    "Brock's Rhydon 2/132" is a card you already have. Cached in wantlist.json:
+    refreshed daily or when the CSV changes; a stale cache is used if the site is down."""
     import hashlib
     csv_hash = hashlib.sha1(Path(csv_path).read_bytes()).hexdigest()
     cache = json.loads(WANT_PATH.read_text()) if WANT_PATH.exists() else None
-    if cache and cache.get("csv") == csv_hash:
+    if cache and (cache.get("v") != 2 or cache.get("csv") != csv_hash):
+        cache = None
+    if cache:
         age = datetime.now(timezone.utc) - datetime.fromisoformat(cache["at"])
         if age < timedelta(hours=24):
-            return cache["want"]
+            return cache["index"]
     owned = owned_numbers(csv_path)
     headers = {"X-Api-Key": os.environ["POKEMONTCG_API_KEY"]} if os.environ.get("POKEMONTCG_API_KEY") else {}
-    want = {}
+    index = {}
     try:
-        for set_name, (set_id, _tot) in SETS.items():
+        for set_name, (set_id, total) in SETS.items():
             for c in fetch_set(set_id, headers):
-                if c["number"] in owned[set_name]:
-                    continue
-                want.setdefault(c["number"], []).append(
+                index.setdefault(f"{c['number']}/{total}", []).append(
                     {"set": set_name, "name": c["name"], "number": c["number"],
-                     "market": best_market(c)})
+                     "market": best_market(c), "owned": c["number"] in owned[set_name]})
     except requests.RequestException:
-        if cache and cache.get("csv") == csv_hash:
-            print("Card-data site down; using stale cached want list")
-            return cache["want"]
+        if cache:
+            print("Card-data site down; using stale cached card list")
+            return cache["index"]
         raise
-    WANT_PATH.write_text(json.dumps({"csv": csv_hash,
+    WANT_PATH.write_text(json.dumps({"v": 2, "csv": csv_hash,
                                      "at": datetime.now(timezone.utc).isoformat(),
-                                     "want": want}))
-    return want
+                                     "index": index}))
+    return index
 
 
 # ---------------- Matching ----------------
-def match_title(title, want):
-    """Return match dict or None. Number is the source of truth."""
+def norm(s):
+    s = s.lower().replace("\u2019", "'").replace("\u2018", "'")
+    s = re.sub(r"[.'`]", "", s)
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", s)).strip()
+
+
+SET_WORDS = {"Fossil": r"\bfossil\b", "Team Rocket": r"\bteam rocket\b",
+             "Gym Heroes": r"\bgym heroes\b", "Gym Challenge": r"\bgym challenge\b"}
+
+
+def match_title(title, index):
+    """Return match dict or None. The number is the source of truth; the index holds
+    every card (owned or not) so titles naming a card you own are dropped."""
     if SKIP_WORDS.search(title):
         return None
     nums = NUM_RE.findall(title)
     if len(set(nums)) != 1:      # none, or several cards in one listing
         return None
-    num, total = nums[0][0].lstrip("0") or "0", int(nums[0][1])
-    cands = [w for w in want.get(num, []) if SETS[w["set"]][1] == total]
+    num, total = nums[0][0].lstrip("0") or "0", nums[0][1]
+    cands = index.get(f"{num}/{total}")
     if not cands:
         return None
+    t = norm(title)
+    named_sets = [n for n, rx in SET_WORDS.items() if re.search(rx, t)]
+    named = [c for c in cands if re.search(r"\b" + re.escape(norm(c["name"])) + r"\b", t)]
+    if named:
+        if named_sets and not any(c["set"] in named_sets for c in named):
+            return None          # title contradicts itself (card from one set, name of another)
+        cands = [c for c in named if not named_sets or c["set"] in named_sets]
+    elif named_sets:
+        cands = [c for c in cands if c["set"] in named_sets]
+        if not cands:
+            return None          # title names a set this number doesn't belong to
+    unowned = [c for c in cands if not c["owned"]]
+    if not unowned:
+        return None              # it's a card you already have
+    if len(cands) > 1 and len(unowned) < len(cands):
+        return None              # could be a card you own: too noisy to alert
     notes = []
-    low = title.lower()
-    if len(cands) > 1:  # /132 is shared by Gym Heroes and Gym Challenge
-        by_set = [c for c in cands if c["set"].lower() in low]
-        if by_set:
-            cands = by_set
     if len(cands) > 1:
-        by_name = [c for c in cands if c["name"].lower().split("'s ")[-1].split()[0] in low]
-        if len(by_name) == 1:
-            cands = by_name
-    if len(cands) > 1:
-        notes.append("set unclear (Gym Heroes vs Gym Challenge)")
-    card = min(cands, key=lambda c: c["market"] if c["market"] else 1e9)
-    core = re.sub(r"[^a-z ]", "", card["name"].lower().replace("'s", "")).split()
-    if core and not any(w in low for w in core):
+        notes.append("set unclear: " + " or ".join(c["set"] for c in cands))
+    card = min(unowned, key=lambda c: c["market"] if c["market"] else 1e9)
+    if not named:
         notes.append(f"title doesn't name the card; number says {card['name']}")
     return {"card": card, "notes": notes}
 
@@ -248,6 +267,8 @@ def send_alert(d, dry):
     title = f"{d['pct']:.0f}% off: {d['card']['name']} {d['card']['number']} ({d['card']['set']})"
     lines = [f"${d['total']:.2f} total vs ${d['card']['market']:.2f} market",
              d["title"][:100]]
+    if d.get("condition"):
+        lines.append(f"Condition: {d['condition']}")
     if d["auction"]:
         lines.append(f"AUCTION ends {d['ends']} (current bid, may rise)")
     lines += [f"Note: {n}" for n in d["notes"]]
@@ -274,7 +295,7 @@ def send_alert(d, dry):
 # ---------------- Main ----------------
 def run(dry):
     want = build_want_list(CSV_PATH)
-    print(f"Want list: {sum(len(v) for v in want.values())} cards")
+    print(f"Want list: {sum(1 for v in want.values() for c in v if not c['owned'])} cards missing")
     seen = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
     token = ebay_token()
     now = datetime.now(timezone.utc)
@@ -309,12 +330,13 @@ def run(dry):
         deals.append({"iid": iid, "card": m["card"], "title": it["title"], "total": total,
                       "pct": (1 - total / market) * 100, "auction": is_auction,
                       "ends": it.get("itemEndDate", ""), "notes": list(m["notes"]),
-                      "url": it.get("itemWebUrl", "")})
+                      "url": it.get("itemWebUrl", ""), "condition": it.get("condition", "")})
     deals.sort(key=lambda d: d["pct"], reverse=True)
     print(f"Matched {matched} listings to your want list; {len(deals)} cleared the discount bar")
     for d in deals[:60]:   # full detail in the log so you can sanity-check
-        print(f"  {d['pct']:.0f}% off | {d['card']['set']} #{d['card']['number']} {d['card']['name']} | "
-              f"${d['total']:.2f} vs ${d['card']['market']:.2f} | {d['title'][:70]}")
+        print(f"  {d['pct']:.0f}% off{' [AUCTION]' if d['auction'] else ''} | {d['card']['set']} "
+              f"#{d['card']['number']} {d['card']['name']} | ${d['total']:.2f} vs ${d['card']['market']:.2f} "
+              f"| {d['condition'][:12]} | {d['title'][:70]}")
     alerts = 0
     for d in deals[:MAX_ALERTS]:
         conflict = specifics_conflict(token, {"itemId": d["iid"]}, d["card"])
@@ -335,30 +357,42 @@ def run(dry):
 
 
 def selftest():
-    want = {
-        "29": [{"set": "Fossil", "name": "Kabutops", "number": "29", "market": 8.0}],
-        "6": [{"set": "Gym Heroes", "name": "Koga's Ditto", "number": "6", "market": 50.0},
-              {"set": "Gym Challenge", "name": "Giovanni's Gyarados", "number": "6", "market": 40.0}],
-        "4": [{"set": "Team Rocket", "name": "Dark Dragonite", "number": "4", "market": 30.0}],
+    def card(st, name, n, mk, owned):
+        return {"set": st, "name": name, "number": n, "market": mk, "owned": owned}
+    idx = {
+        "2/132": [card("Gym Heroes", "Brock's Rhydon", "2", 40, True),
+                  card("Gym Challenge", "Blaine's Charizard", "2", 586, False)],
+        "6/132": [card("Gym Heroes", "Lt. Surge's Electabuzz", "6", 53, False),
+                  card("Gym Challenge", "Giovanni's Machamp", "6", 85, False)],
+        "121/132": [card("Gym Heroes", "Blaine's Gamble", "121", 10, True),
+                    card("Gym Challenge", "Sabrina's Psychic Control", "121", 9, False)],
+        "29/62": [card("Fossil", "Kabutops", "29", 8, False)],
+        "4/82": [card("Team Rocket", "Dark Charizard", "4", 90, False)],
     }
-    cases = [
-        ("Pokemon Fossil Kabutops 29/62 Holo NM", "Kabutops 29"),
-        ("Kabutops 29/62 HOLO rare 1999 wotc", "Kabutops 29"),
-        ("Koga's Ditto 6/132 Gym Heroes", "Koga's Ditto 6"),
-        ("Rare holo Pokemon card 6 / 132 Giovanni's Gyarados", "Giovanni's Gyarados 6"),
-        ("Pokemon card 6/132 wotc", "ambiguous -> flagged"),
+    cases = [  # (title, expected card name or None)
+        ("2000 Pokemon Gym Heroes Brock's Rhydon Holo #002/132", None),
+        ("Brock\u2019s Rhydon 2/132 Gym Challenge Holo", None),
+        ("Blaine's Gamble 121/132 Gym Heroes Regular", None),
+        ("Giovanni's Machamp 6/132 Gym Challenge Holo Rare", "Giovanni's Machamp"),
+        ("Lt. Surge's Electabuzz 6/132 Gym Heroes Rare", "Lt. Surge's Electabuzz"),
+        ("Pokemon card 6/132 wotc", "Lt. Surge's Electabuzz"),      # both unowned: flagged unclear
+        ("Pokemon card 2/132 wotc", None),                           # might be one you own
+        ("Rocket's Zapdos 15/132 25th Anniversary Holo", None),
+        ("Misty 018/132 Gym Heroes Gold Holo 30th Anniversary", None),
         ("PSA 9 Kabutops 29/62", None),
         ("Lot of 10 fossil cards 29/62 3/62", None),
-        ("Mystery holo 4/82 Team Rocket", "Dark Dragonite 4 (name not in title)"),
+        ("Pokemon Fossil Kabutops 29/62 Holo NM", "Kabutops"),
+        ("Mystery holo 4/82 Team Rocket", "Dark Charizard"),
         ("Kabutops 28/62", None),
         ("Pokemon Kabutops 29/64 Neo", None),
     ]
     ok = True
     for t, expect in cases:
-        m = match_title(t, want)
-        got = None if not m else f"{m['card']['name']} {m['card']['number']}" + (f" | {m['notes']}" if m['notes'] else "")
-        print(f"{'.' if (got is None) == (expect is None) else 'X'} {t!r} -> {got}")
-        ok &= (got is None) == (expect is None)
+        m = match_title(t, idx)
+        got = m["card"]["name"] if m else None
+        good = got == expect
+        ok &= good
+        print(f"{'.' if good else 'X'} {t!r} -> {got}" + (f" {m['notes']}" if m and m["notes"] else ""))
     sys.exit(0 if ok else 1)
 
 
