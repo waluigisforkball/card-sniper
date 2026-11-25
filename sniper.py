@@ -28,6 +28,7 @@ SEARCH_PAGES = 2              # 200 listings per page per query
 CSV_PATH = Path("dexcollection.csv")
 STATE_PATH = Path("seen.json")
 WANT_PATH = Path("wantlist.json")
+GOT_PATH = Path("got.txt")
 
 SETS = {  # name -> (pokemontcg.io id, printed total)
     "Fossil": ("base3", 62),
@@ -107,7 +108,7 @@ def fetch_set(set_id, headers, tries=5):
     raise last
 
 
-def build_want_list(csv_path):
+def load_index(csv_path):
     """Index of EVERY card in the four sets: {"num/total": [ {set,name,number,market,owned} ]}.
     Owned cards are included so the matcher can tell that a title like
     "Brock's Rhydon 2/132" is a card you already have. Cached in wantlist.json:
@@ -138,6 +139,41 @@ def build_want_list(csv_path):
     WANT_PATH.write_text(json.dumps({"v": 2, "csv": csv_hash,
                                      "at": datetime.now(timezone.utc).isoformat(),
                                      "index": index}))
+    return index
+
+
+def read_got():
+    """Cards you've picked up since the CSV export, from got.txt (one per line,
+    like 'Gym Heroes 12'). Lines starting with // are comments."""
+    got = set()
+    if not GOT_PATH.exists():
+        return got
+    for line in GOT_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("//"):
+            continue
+        sets = [n for n, rx in SET_WORDS.items() if re.search(rx, norm(line))]
+        m = re.search(r"\d+", line)
+        if len(sets) == 1 and m:
+            got.add((sets[0], str(int(m.group()))))
+        else:
+            print(f"got.txt: couldn't read this line, ignoring it: {line!r}")
+    return got
+
+
+def build_want_list(csv_path):
+    """Card index with your CSV plus got.txt applied (got.txt is applied after the
+    cache, so editing it never needs a refetch)."""
+    index = load_index(csv_path)
+    got = read_got()
+    marked = 0
+    for cards in index.values():
+        for c in cards:
+            if (c["set"], c["number"]) in got and not c["owned"]:
+                c["owned"] = True
+                marked += 1
+    if got:
+        print(f"got.txt: {marked} cards marked off")
     return index
 
 
@@ -290,7 +326,7 @@ def send_digest(deals, dry):
         extras += d["notes"]
         if extras:
             line += " (" + "; ".join(extras) + ")"
-        entry = line + "\n" + d["url"]
+        entry = line + "\n" + d["url"] + f"\ngot.txt line: {c['set']} {c['number']}"
         if size + len(entry.encode("utf-8")) > 3600:
             break
         parts.append(entry)
