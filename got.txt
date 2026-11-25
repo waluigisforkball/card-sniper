@@ -1,0 +1,7 @@
+// Cards I've picked up since my last collection export.
+// One per line: set name + card number. Examples (delete the // to use them):
+// Gym Heroes 12
+// Fossil 5
+// Team Rocket 21
+// Gym Challenge 66
+// Lines starting with // are ignored. Commit the file and the next run skips these cards.
